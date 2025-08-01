@@ -4,15 +4,15 @@ A Node.js Express backend server that provides a clean API interface to the Metr
 
 ## Prerequisites
 
-- Node.js (version 2 or higher)
+- Node.js (version 20 or higher)
 - npm or yarn package manager
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd Backend
+git clone git@github.com:kawanofer/met-museum-backend.git
+cd met-museum-backend
 ```
 
 2. Install dependencies:
