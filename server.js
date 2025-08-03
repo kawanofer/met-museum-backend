@@ -4,6 +4,7 @@ const axios = require("axios");
 const cors = require("cors");
 const NodeCache = require("node-cache");
 const PQueue = require("p-queue").default;
+const https = require("https");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -13,9 +14,15 @@ const metApiCache = new NodeCache({ stdTTL: 3600 });
 
 // --- Configuração do Rate Limiting ---
 const queue = new PQueue({
-  concurrency: 5, // Limita a 5 requisições simultâneas para não sobrecarregar
-  intervalCap: 70, // Permitir 70 requisições
+  concurrency: 3, // 3 requisições simultâneas
+  intervalCap: 30, // 30 requisições por intervalo
   interval: 1000, // A cada 1000 ms (1 segundo)
+  timeout: 15000, // Timeout de 15 segundos por requisição
+});
+
+const agent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: false
 });
   
 // Middleware
@@ -23,7 +30,7 @@ app.use(cors()); // Habilita CORS para todas as rotas
 app.use(express.json()); // Habilita o parsing de JSON no corpo das requisições
 
 // Função genérica para fazer requisições à API do Met Museum com cache e rate limiting
-async function makeMetApiRequest(urlPath, cacheKey) {
+async function makeMetApiRequest(urlPath, cacheKey, retryCount = 0) {
   // 1. Tentar obter do cache
   const cachedData = metApiCache.get(cacheKey);
   if (cachedData) {
@@ -32,21 +39,56 @@ async function makeMetApiRequest(urlPath, cacheKey) {
   }
 
   // 2. Se não estiver no cache, adicionar à fila para requisição
-  console.log(`[QUEUEING] ${urlPath}`);
+  console.log(`[-> QUEUEING] ${urlPath}`);
   const response = await queue.add(async () => {
     try {
-      console.log(`[FETCHING] ${urlPath}`);
+      console.log(`[<- FETCHING] ${urlPath}`);
 
       const response = await axios.get(
         `${process.env.MET_API_BASE_URL}${urlPath}`,
+        {
+          timeout: 10000,
+          httpsAgent: agent,
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Encoding': 'gzip, deflate, br, zstd',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'DNT': '1',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+          }
+        }
       );
-      metApiCache.set(cacheKey, response.data); // Armazena no cache
+      metApiCache.set(cacheKey, response.data);
       return response.data;
     } catch (error) {
       console.error(`Error fetching from Met API ${urlPath}:`, error.message);
-      if (error.response && error.response.status === 403) {
-        throw new Error("Met Museum API: Rate limit exceeded or forbidden.");
+      
+      // Retry para erros 403
+      if (error.response && error.response.status === 403 && retryCount < 2) {
+        console.log(`[RETRY] Attempt ${retryCount + 1} for ${urlPath} after 403 error`);
+        await new Promise(resolve => setTimeout(resolve, (retryCount + 1) * 2000));
+        return makeMetApiRequest(urlPath, cacheKey, retryCount + 1);
       }
+      
+      if (error.response && error.response.status === 403) {
+        throw new Error("Met Museum API: Access forbidden. The API might be temporarily unavailable or there may be IP restrictions.");
+      }
+      
+      // Retry para erros de rede
+      if (error.code === 'ENOTFOUND' || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
+        if (retryCount < 1) {
+          console.log(`[RETRY] Network error for ${urlPath}, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          return makeMetApiRequest(urlPath, cacheKey, retryCount + 1);
+        }
+      }
+      
       throw error;
     }
   });
@@ -56,7 +98,7 @@ async function makeMetApiRequest(urlPath, cacheKey) {
 // 1. Buscar obras com imagens: GET /api/artworks/search/images
 app.get("/api/artworks/search/images", async (req, res) => {
   try {
-    const query = req.query.q || "painting"; // Permite que o cliente passe 'q'
+    const query = req.query.q || "painting";
     const urlPath = `/public/collection/v1/search?hasImages=true&q=${encodeURIComponent(query)}`;
     const cacheKey = `search-images-${query}`;
     const data = await makeMetApiRequest(urlPath, cacheKey);
@@ -99,7 +141,7 @@ app.get("/api/artworks/search/artist", async (req, res) => {
 
     const objectIDs = searchData.objectIDs || [];
 
-    // Para cada ID, busca os detalhes.
+    // Para cada ID, busca os detalhes
     const artworkDetailsPromises = objectIDs.map((id) =>
       makeMetApiRequest(
         `/public/collection/v1/objects/${id}`,
@@ -143,22 +185,19 @@ app.get("/api/departments", async (req, res) => {
 app.get("/api/artworks/search/department", async (req, res) => {
   try {
     const departmentId = req.query.departmentId;
-    const query = req.query.q;
-
-    if (!departmentId || !query) {
-      return res
-        .status(400)
-        .json({ error: "departmentId and q are required." });
+    
+    if (!departmentId) {
+      return res.status(400).json({ error: "departmentId is required." });
     }
 
     // Primeiro, busca os IDs das obras do departamento
-    const searchUrlPath = `/public/collection/v1/search?departmentId=${departmentId}&q=${encodeURIComponent(query)}`;
-    const searchCacheKey = `search-department-${departmentId}-${query}`;
+    const searchUrlPath = `/public/collection/v1/search?departmentId=${departmentId}&q=portrait`;
+    const searchCacheKey = `search-department-${departmentId}`;
     const searchData = await makeMetApiRequest(searchUrlPath, searchCacheKey);
 
     const objectIDs = searchData.objectIDs || [];
 
-    // Para cada ID, busca os detalhes.
+    // Para cada ID, busca os detalhes
     const artworkDetailsPromises = objectIDs.map((id) =>
       makeMetApiRequest(
         `/public/collection/v1/objects/${id}`,
@@ -178,7 +217,7 @@ app.get("/api/artworks/search/department", async (req, res) => {
     res.json(artworks);
   } catch (error) {
     console.error(
-      `Error in /api/artworks/search/department for ${req.query.departmentId}, ${req.query.q}:`,
+      `Error in /api/artworks/search/department for ${req.query.departmentId}:`,
       error,
     );
     res.status(error.response?.status || 500).json({ error: error.message });
@@ -190,3 +229,4 @@ app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
   console.log(`Met Museum API Base URL: ${process.env.MET_API_BASE_URL}`);
 });
+
