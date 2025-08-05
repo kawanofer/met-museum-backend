@@ -14,10 +14,10 @@ const metApiCache = new NodeCache({ stdTTL: 3600 });
 
 // --- Configuração do Rate Limiting ---
 const queue = new PQueue({
-  concurrency: 3, // 3 requisições simultâneas
-  intervalCap: 30, // 30 requisições por intervalo
-  interval: 1000, // A cada 1000 ms (1 segundo)
-  timeout: 15000, // Timeout de 15 segundos por requisição
+  concurrency: 3, // Apenas 3 requisições por vez
+  intervalCap: 10, // Apenas 10 requisições por intervalo
+  interval: 2000, // A cada 2 segundos
+  timeout: 30000, // Timeout de 30 segundos por requisição
 });
 
 const agent = new https.Agent({
@@ -47,20 +47,11 @@ async function makeMetApiRequest(urlPath, cacheKey, retryCount = 0) {
       const response = await axios.get(
         `${process.env.MET_API_BASE_URL}${urlPath}`,
         {
-          timeout: 10000,
+          timeout: 15000,
           httpsAgent: agent,
           headers: {
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br, zstd',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'DNT': '1',
-            'Pragma': 'no-cache',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+            'Accept': 'application/json',
+            'User-Agent': 'Met-Museum-Backend/1.0.0'
           }
         }
       );
@@ -70,23 +61,13 @@ async function makeMetApiRequest(urlPath, cacheKey, retryCount = 0) {
       console.error(`Error fetching from Met API ${urlPath}:`, error.message);
       
       // Retry para erros 403
-      if (error.response && error.response.status === 403 && retryCount < 2) {
-        console.log(`[RETRY] Attempt ${retryCount + 1} for ${urlPath} after 403 error`);
-        await new Promise(resolve => setTimeout(resolve, (retryCount + 1) * 2000));
+      if (error.response && error.response.status === 403 && retryCount < 3) {
+        console.warn(`[403 BLOCKED] ${urlPath} - API may be rate limiting or blocking requests`);
+
+        const backoffDelay = Math.pow(2, retryCount) * 2000 + Math.random() * 1000; // Exponential backoff
+        console.log(`[RETRY] Attempt ${retryCount + 1} for ${urlPath} after 403 error (waiting ${Math.round(backoffDelay)}ms)`);
+        await new Promise(resolve => setTimeout(resolve, backoffDelay));
         return makeMetApiRequest(urlPath, cacheKey, retryCount + 1);
-      }
-      
-      if (error.response && error.response.status === 403) {
-        throw new Error("Met Museum API: Access forbidden. The API might be temporarily unavailable or there may be IP restrictions.");
-      }
-      
-      // Retry para erros de rede
-      if (error.code === 'ENOTFOUND' || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
-        if (retryCount < 1) {
-          console.log(`[RETRY] Network error for ${urlPath}, retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          return makeMetApiRequest(urlPath, cacheKey, retryCount + 1);
-        }
       }
       
       throw error;
